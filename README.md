@@ -119,6 +119,11 @@ CPU 的速度：
 
 ### 1. 安装依赖
 
+使用UV
+```bash
+uv sync
+```
+
 ```bash
 pip install onnxruntime-directml pydub numpy scipy gguf srt
 ```
@@ -224,6 +229,12 @@ python transcribe.py test.mp3 --prec int4 --no-dml --no-vulkan --n-ctx 4096
 ```bash
 python 21-Run-ASR.py
 ```
+
+# 运行翻译
+```bash
+uv run python .\transcribe.py ".\video.m4a"
+```
+
 
 部分代码解析：
 
