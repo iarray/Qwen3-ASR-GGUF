@@ -3,12 +3,13 @@ import os
 import time
 import re
 import codecs
+import threading
 import dataclasses
 import numpy as np
 import multiprocessing as mp
 from pathlib import Path
 from collections import deque
-from typing import Optional, List
+from typing import Optional, List, Callable
 
 from .schema import MsgType, StreamingMessage, DecodeResult, ASREngineConfig, TranscribeResult, ForcedAlignItem, ForcedAlignResult
 from .utils import normalize_language_name, validate_language
@@ -29,7 +30,14 @@ class QwenASREngine:
     def __init__(self, config: ASREngineConfig):
         self.config = config
         self.verbose = config.verbose
+        self.quiet = getattr(config, "quiet", False)
         if self.verbose: print(f"--- [QwenASR] 初始化引擎 (Provider: {config.onnx_provider}) ---")
+
+        # 事件回调 (供 UI 实时展示)，可由外部覆盖
+        self.on_stream: Optional[Callable[[str], None]] = None            # 流式文本片段
+        self.on_chunk: Optional[Callable[[int, int, float, float], None]] = None  # (idx, total, start_sec, end_sec)
+        self.on_status: Optional[Callable[[str], None]] = None            # 状态文本
+        self.cancel_event: Optional[threading.Event] = None               # 置位后中断转录
         
         # 路径解析
         llm_gguf = os.path.join(config.model_dir, config.llm_fn)
@@ -65,6 +73,48 @@ class QwenASREngine:
 
     def shutdown(self):
         if self.verbose: print("--- [QwenASR] 引擎已关闭 ---")
+
+    def set_callbacks(
+        self,
+        on_stream: Optional[Callable[[str], None]] = None,
+        on_chunk: Optional[Callable[[int, int, float, float], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ):
+        """注册外部回调，便于 UI 实时展示转录过程"""
+        self.on_stream = on_stream
+        self.on_chunk = on_chunk
+        self.on_status = on_status
+        self.cancel_event = cancel_event
+
+    def _emit_piece(self, piece: str):
+        """输出一段流式文本：优先交给回调，否则打印到控制台"""
+        if self.on_stream is not None:
+            try:
+                self.on_stream(piece)
+            except Exception:
+                pass
+        elif not self.quiet:
+            print(re.sub(r'([，。？！：,\.])', r'\1\n', piece), end='', flush=True)
+
+    def _emit_chunk(self, idx: int, total: int, start_sec: float, end_sec: float):
+        if self.on_chunk is not None:
+            try:
+                self.on_chunk(idx, total, start_sec, end_sec)
+            except Exception:
+                pass
+
+    def _emit_status(self, text: str):
+        if self.on_status is not None:
+            try:
+                self.on_status(text)
+            except Exception:
+                pass
+        elif self.verbose and not self.quiet:
+            print(text)
+
+    def _is_cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
 
     def _build_prompt_embd(self, audio_embd: np.ndarray, prefix_text: str, context: Optional[str], language: Optional[str]):
         """构造用于 LLM 输入的 Embedding 序列 (区块化打包模式)"""
@@ -131,7 +181,11 @@ class QwenASREngine:
         for _ in range(512): # Max new tokens per chunk
             if last_sampled_token in [self.model.eos_token, self.ID_IM_END]:
                 break
-            
+
+            if self._is_cancelled():
+                result.is_aborted = True
+                break
+
             if self.ctx.decode_token(last_sampled_token) != 0:
                     break
             
@@ -141,7 +195,7 @@ class QwenASREngine:
                 stable_tokens.append(ready_token)
                 piece = text_decoder.decode(self.model.token_to_bytes(ready_token))
                 if piece:
-                    if streaming: print(re.sub(r'([，。？！：,\.])', r'\1\n', piece), end='', flush=True)
+                    if streaming: self._emit_piece(piece)
                     stable_text_acc += piece
             
             # 熔断检查：检测重复循环
@@ -163,11 +217,11 @@ class QwenASREngine:
                 stable_tokens.append(t)
                 piece = text_decoder.decode(self.model.token_to_bytes(t))
                 if piece:
-                    if streaming: print(re.sub(r'([，。？！：,\.])', r'\1\n', piece), end="", flush=True)
+                    if streaming: self._emit_piece(piece)
                     stable_text_acc += piece
             final_p = text_decoder.decode(b"", final=True)
             if final_p: 
-                if streaming: print(final_p, end='', flush=True)
+                if streaming: self._emit_piece(final_p)
                 stable_text_acc += final_p
         
         # 填充结果（内核输出标准化）
@@ -194,9 +248,12 @@ class QwenASREngine:
             res = self._decode(full_embd, prefix_text, rollback_num, is_last_chunk, temperature, streaming=streaming)
             if not res.is_aborted:
                 break
+            if self._is_cancelled():
+                break
             temperature += 0.3
             res.text += "====解码有误，强制熔断===="
-            print(f"\n\n[!] 触发重试 (Temp -> {temperature:.1f})\n")
+            if not self.quiet:
+                print(f"\n\n[!] 触发重试 (Temp -> {temperature:.1f})\n")
         return res 
 
     def _print_stats(self, stats: dict, audio_duration: float, t_total: float):
@@ -249,7 +306,7 @@ class QwenASREngine:
         temperature: float = 0.4,
         rollback_num: int = 5
     ) -> TranscribeResult:
-        """运行完整转录流水线 (三级流水线：i+1 预取, i 识别, i-1 对齐)"""
+        """运行完整转录流水线 (顺序同步：编码 -> LLM -> 对齐)"""
         # 语言归一化与校验
         if language:
             language = normalize_language_name(language)
@@ -278,11 +335,22 @@ class QwenASREngine:
             "prefill_time": 0.0, "decode_time": 0.0,
             "prefill_tokens": 0, "decode_tokens": 0,
             "encode_time": 0.0, "align_time": 0.0,
+            "cancelled": False,
         }
         t_main_start = time.time()
 
         # --- 顺序同步处理循环 ---
         for i in range(num_chunks):
+            # 0. 中断检查
+            if self._is_cancelled():
+                stats["cancelled"] = True
+                self._emit_status("已中断转录")
+                break
+
+            if self.on_stream is not None:
+                self._emit_status("\n" if i > 0 else "")
+            self._emit_chunk(i, num_chunks, all_segments[i].audio_start, all_segments[i].audio_end)
+
             # 1. 编码第 i 片段
             s, e = i * samples_per_chunk, min((i + 1) * samples_per_chunk, total_len)
             chunk_data = audio[s:e]
@@ -330,6 +398,8 @@ class QwenASREngine:
         # 4. 结果整理
         all_aligned_items.sort(key=lambda x: x.start_time)
         t_total = time.time() - t_main_start
+        stats["total_time"] = t_total
+        stats["audio_duration"] = total_duration
         if self.verbose: self._print_stats(stats, total_duration, t_total)
             
         return TranscribeResult(

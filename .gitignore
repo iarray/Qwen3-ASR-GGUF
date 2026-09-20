@@ -72,6 +72,10 @@ Thumbs.db
 ~/.cache/huggingface/
 huggingface_cache/
 
+# ================= 界面配置 / 生成的产物 =================
+ui_settings.json
+*.json.tmp
+
 
 model/
 logs/

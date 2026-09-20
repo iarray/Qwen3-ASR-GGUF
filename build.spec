@@ -26,6 +26,11 @@ hiddenimports += [
     'numpy',
     'typer',
     'srt',
+    # 说话人分离 ONNX 后端：这些是惰性导入，PyInstaller 扫不到，必须显式声明
+    'onnxruntime',
+    'scipy',
+    'scipy.cluster.hierarchy',
+    'scipy.spatial.distance',
 ]
 
 

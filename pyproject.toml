@@ -14,11 +14,13 @@ dependencies = [
     "nagisa>=0.3.0",
     "onnxruntime-directml>=1.24.4",
     "onnxscript>=0.7.2",
+    "pyannote-audio>=4.0.7",
     "sentencepiece>=0.2.2",
     "soundfile>=0.14.0",
     "srt>=3.5.3",
     "torch>=2.14.0",
     "transformers==4.57.6",
+    "ttkbootstrap>=2.2.3",
     "typer>=0.27.2",
 ]
 

@@ -9,3 +9,11 @@ accelerate
 onnxscript
 srt
 sentencepiece
+# 说话人识别（二选一，ONNX 优先）
+# 1) ONNX Runtime 后端：默认用 DirectML 版（兼容 AMD / Intel / NVIDIA）
+#    如需 CUDA 加速，改成 onnxruntime-gpu；纯 CPU 用 onnxruntime
+onnxruntime-directml
+# 2) pyannote 原生 PyTorch 后端（可选；模型为 HuggingFace gated 资源，需要 HF Token）
+pyannote.audio
+# 图形界面
+ttkbootstrap

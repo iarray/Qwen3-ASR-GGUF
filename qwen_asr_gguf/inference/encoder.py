@@ -218,8 +218,14 @@ class QwenAudioEncoder:
         # 1. 形状检查与 Padding (仅在 DML 开启时执行)
         if self.active_dml and seq_len < self.h_target_len:
             pad_width = self.h_target_len - seq_len
-            # 对 hidden_states 进行零填充 -> (Batch, T_fixed, D)
-            hidden_input = np.pad(hidden_states, ((0,0), (0, pad_width), (0,0)), mode='constant')
+            # 注意：这里必须复制末帧填充，不能用零填充。
+            # DirectML 后端收到全零 hidden_states 时，内部的归一化算子会算出 NaN，
+            # 且 NaN 会污染整段的输出，导致下游（如对齐器）时间戳全部为 0。
+            # 复制末帧同样是"无意义帧"，但不会触发该问题（实测与 CPU 结果 max|Δ|=1.4e-4）。
+            hidden_input = np.concatenate(
+                [hidden_states, np.repeat(hidden_states[:, -1:, :], pad_width, axis=1)],
+                axis=1,
+            )
             
             # 构造 Mask：前 seq_len 为 0 (关注)，后 pad_width 为 -10000.0 (屏蔽)
             # 维度需要广播到 (Batch, 1, T_fixed, T_fixed)
