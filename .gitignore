@@ -1,0 +1,78 @@
+# ================= Python 基础 =================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ================= uv 虚拟环境 =================
+.venv/
+venv/
+env/
+ENV/
+# uv.lock 建议提交！锁定依赖，不要注释掉这行
+# uv.lock
+
+# ================= 环境变量密钥 =================
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ================= ASR / GGUF / 音频（重点！）================
+# GGUF模型文件（体积巨大，不上git）
+*.gguf
+*.ggml
+
+# 音频素材、wav、mp3、flac
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+
+# 生成字幕、临时分片音频
+*.srt
+*.vtt
+tmp_audio/
+temp/
+output/
+cache/
+
+# ================= 测试、lint缓存 =================
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ================= VSCode / Windows =================
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# ================= huggingface / 模型缓存 =================
+~/.cache/huggingface/
+huggingface_cache/
+
+
+model/
+logs/
+qwen_asr_gguf/inference/bin/
