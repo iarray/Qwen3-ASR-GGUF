@@ -15,7 +15,9 @@ subtitle.py - 字幕断句与说话人合并
 - **说话人切换即换行**：字幕不跨说话人，便于阅读与配音。
 """
 import re
-from typing import Callable, List, Optional, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import srt
 
@@ -500,3 +502,448 @@ def export_segments_to_srt(
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     return content
+
+
+# --------------------------------------------------------------------------- #
+# 5.5 SRT 解析（用于「只翻译已有字幕文件」的场景）
+#
+# 需求：允许把已经生成好的 .srt 直接丢进来，只补一份译文，不必再从音频重跑一遍
+# 解码 + 说话人识别 + 语音识别。因此这里需要一个**健壮**的 SRT 读取器：
+#   * 兼容 UTF-8 / UTF-8-BOM / GB18030 / BIG5 等编码（字幕文件常见各种编码）；
+#   * 识别 `[spk0] 你好。` 形式的说话人前缀，拆进 SubtitleSegment.speaker；
+#   * 序号、时间轴的小毛病（缺序号、逗号/句点做小数点）都要能容忍。
+# --------------------------------------------------------------------------- #
+
+# 按顺序尝试的编码；latin-1 永不失败，作为最后兜底
+_TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "big5", "latin-1")
+
+# 兜底解析用的时间轴正则：00:00:01,234 --> 00:00:03,456
+_SRT_TIME_RE = re.compile(
+    r"(\d{1,3}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*"
+    r"(\d{1,3}):(\d{2}):(\d{2})[,.](\d{1,3})"
+)
+
+
+def read_text_auto(path) -> str:
+    """按常见字幕编码读取文本文件（不会抛 UnicodeDecodeError）"""
+    data = Path(path).read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):        # UTF-8 BOM
+        data = data[3:]
+    for enc in _TEXT_ENCODINGS:
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _srt_time_to_sec(h: str, m: str, s: str, ms: str) -> float:
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms.ljust(3, "0")[:3]) / 1000.0
+
+
+def _parse_srt_blocks(text: str) -> List[Tuple[float, float, str]]:
+    """逐块扫描的兜底解析器：容忍缺失序号 / 时间轴格式小毛病
+
+    返回 `[(起始秒, 结束秒, 正文), ...]`。
+    """
+    out: List[Tuple[float, float, str]] = []
+    cur_times: Optional[Tuple[float, float]] = None
+    cur_body: List[str] = []
+
+    def flush():
+        nonlocal cur_times, cur_body
+        body = " ".join(x.strip() for x in cur_body if x.strip()).strip()
+        if cur_times is not None and body:
+            out.append((cur_times[0], cur_times[1], body))
+        cur_times = None
+        cur_body = []
+
+    for line in text.split("\n"):
+        m = _SRT_TIME_RE.search(line)
+        if m:
+            flush()
+            g = m.groups()
+            cur_times = (_srt_time_to_sec(*g[:4]), _srt_time_to_sec(*g[4:8]))
+            continue
+        if cur_times is None:
+            continue                                # 序号行、空行等一律忽略
+        if line.strip():
+            cur_body.append(line)
+        else:
+            flush()
+    flush()
+    return out
+
+
+def _normalize_srt_body(raw: str) -> str:
+    """把多行正文压成一行，并去掉首尾空白"""
+    return " ".join(part.strip() for part in (raw or "").splitlines() if part.strip()).strip()
+
+
+def parse_srt(content: str) -> List[SubtitleSegment]:
+    """把 SRT 文本解析为字幕片段列表
+
+    - 支持 `[spk0] 你好。` 形式的说话人前缀（拆分到 `speaker` 字段，正文不含前缀）；
+    - 多行正文按空格拼接为单行（本项目的字幕行都不含换行）；
+    - `end <= start` 时补 0.05 秒，避免下游出现零长字幕。
+    """
+    if not content:
+        return []
+
+    text = content.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+
+    raw: List[Tuple[float, float, str]] = []
+    try:
+        for sub in srt.parse(text):
+            raw.append((
+                sub.start.total_seconds(),
+                sub.end.total_seconds(),
+                _normalize_srt_body(sub.content),
+            ))
+    except Exception:
+        raw = []
+    if not raw:
+        # srt 库解析不出东西（格式不规范）时走兜底扫描
+        raw = _parse_srt_blocks(text)
+
+    segments: List[SubtitleSegment] = []
+    for start, end, body in raw:
+        body = _normalize_srt_body(body)
+        if not body:
+            continue
+        speaker, body = split_speaker_prefix(body)
+        if not body:
+            continue
+        start = max(0.0, float(start))
+        end = float(end)
+        if end <= start:
+            end = start + 0.05
+        segments.append(
+            SubtitleSegment(
+                index=len(segments) + 1,
+                start_time=start,
+                end_time=end,
+                text=body,
+                speaker=speaker,
+            )
+        )
+    return segments
+
+
+def load_srt_segments(path) -> Tuple[List[SubtitleSegment], bool]:
+    """读取 SRT 文件，返回 `(片段列表, 是否带说话人标记)`
+
+    是否带说话人标记由内容自动判断（只要有一行带 `[spkX]` 前缀就算），
+    这样 GUI / CLI 不必让用户再勾一个额外选项。
+    """
+    segments = parse_srt(read_text_auto(path))
+    has_speaker = any(seg.speaker for seg in segments)
+    return segments, has_speaker
+
+
+# --------------------------------------------------------------------------- #
+# 6. 翻译支持：合并成完整句 → 翻译 → 拆回多行
+#
+# 需求约定：
+#   * 如果某行结尾没有句末标点（内容不完整），就与后面若干行合并，直到遇见句末标点，
+#     合并后的多行一起送去翻译（保证模型看到的是完整语义）；
+#   * 合并块的总时长 = 参与合并的各行时长之和；
+#   * 译文再按标点拆回多行，每行尽量 ≤ max_duration 秒，拆完的总时长与原合并块一致；
+#   * 每行译文保留原说话人标记。
+# --------------------------------------------------------------------------- #
+
+# 说话人前缀：字幕正文里可能已经带了 `[spk0] `，需要剥离后再翻译
+_SPEAKER_PREFIX_RE = re.compile(r"^\s*\[([^\]]{1,32})\]\s*")
+
+# 译文里允许作为断点的标点（中文优先，兼容英文）
+_TRANS_BREAK_CHARS = "。！？!?…～；;，、：:"
+
+
+@dataclass
+class TranslationUnit:
+    """翻译单元：若干连续字幕行合并出的一个完整语义块"""
+    texts: List[str] = field(default_factory=list)      # 参与合并的各行正文（已剥离说话人前缀）
+    segments: List[SubtitleSegment] = field(default_factory=list)
+    text: str = ""                                      # 合并后的原文（送去翻译的字符串）
+    start: float = 0.0                                  # 块的起始时间
+    end: float = 0.0                                    # 块的结束时间
+    duration: float = 0.0                               # 各行时长合计（译文按此分配时间）
+    speaker: str = ""                                   # 说话人标记（组内唯一）
+    complete: bool = False                              # 是否以句末标点收尾
+
+    @property
+    def merged_rows(self) -> int:
+        return len(self.segments)
+
+
+def split_speaker_prefix(text: str) -> Tuple[str, str]:
+    """把 `[spk0] 你好。` 拆成 `("spk0", "你好。")`；没有前缀时返回 `("", text)`"""
+    if not text:
+        return "", ""
+    m = _SPEAKER_PREFIX_RE.match(text)
+    if not m:
+        return "", text.strip()
+    return m.group(1), text[m.end():].strip()
+
+
+def group_segments_for_translation(
+    segments: Sequence[SubtitleSegment],
+    max_group_duration: float = 30.0,
+) -> List[TranslationUnit]:
+    """把字幕行按「完整句子」聚合为翻译单元
+
+    聚合规则：
+    1. 遇到句末标点（。！？!?…）就闭合一个单元；
+    2. 说话人切换时强制闭合 —— 否则合并后的译文无法再挂回唯一的说话人标记；
+    3. 单块时长超过 `max_group_duration` 时强制闭合，避免整段音频被并成一个超大请求。
+    """
+    units: List[TranslationUnit] = []
+    cur: List[SubtitleSegment] = []
+
+    def flush():
+        nonlocal cur
+        if not cur:
+            return
+        texts: List[str] = []
+        for seg in cur:
+            _, body = split_speaker_prefix(seg.text)
+            if body:
+                texts.append(body)
+        if not texts:
+            cur = []
+            return
+        merged = _join_pieces(texts).strip()
+        if merged:
+            speaker = cur[0].speaker or split_speaker_prefix(cur[0].text)[0]
+            units.append(
+                TranslationUnit(
+                    texts=texts,
+                    segments=list(cur),
+                    text=merged,
+                    start=cur[0].start_time,
+                    end=max(s.end_time for s in cur),
+                    duration=sum(max(0.0, s.end_time - s.start_time) for s in cur),
+                    speaker=speaker,
+                    complete=_ends_sentence(merged),
+                )
+            )
+        cur = []
+
+    for seg in segments:
+        body = split_speaker_prefix(seg.text)[1]
+        if not body:
+            continue
+        spk = seg.speaker or split_speaker_prefix(seg.text)[0]
+
+        if cur:
+            prev_spk = cur[-1].speaker or split_speaker_prefix(cur[-1].text)[0]
+            if spk and prev_spk and spk != prev_spk:
+                flush()
+            elif (seg.end_time - cur[0].start_time) > max_group_duration:
+                flush()
+
+        cur.append(seg)
+        if _ends_sentence(body):
+            flush()
+
+    flush()
+    return units
+
+
+def _split_piece_once(text: str, max_chars: int) -> Tuple[str, str]:
+    """把一段文本尽量平均地一分为二，优先断在从句标点或空格处"""
+    n = len(text)
+    if n < 2:
+        return text, ""
+    mid = n // 2
+    win = max(2, n // 3)
+
+    lo = max(1, mid - win)
+    hi = min(n, mid + win + 1)
+
+    cut = None
+    for i in range(lo, hi):
+        if text[i - 1] in _TRANS_BREAK_CHARS:
+            if cut is None or abs(i - mid) < abs(cut - mid):
+                cut = i
+    if cut is None:
+        for i in range(lo, hi):
+            if text[i - 1] == " ":
+                if cut is None or abs(i - mid) < abs(cut - mid):
+                    cut = i
+    if cut is None:
+        cut = mid
+
+    left, right = text[:cut].strip(), text[cut:].strip()
+    if not right:
+        return text, ""
+    return left, right
+
+
+def _enforce_piece_limits(
+    pieces: List[str],
+    total_duration: float,
+    max_duration: float,
+    max_chars: int,
+    min_piece_chars: int = 4,
+) -> List[str]:
+    """拆到每一段的预估时长都不超过 max_duration、且字数不超过 max_chars"""
+    for _ in range(400):
+        total_chars = sum(len(p) for p in pieces) or 1
+        target = None
+        for i, p in enumerate(pieces):
+            est = total_duration * len(p) / total_chars if total_duration > 0 else 0.0
+            if len(p) > max_chars or (est > max_duration and len(p) > min_piece_chars):
+                target = i
+                break
+        if target is None:
+            break
+        left, right = _split_piece_once(pieces[target], max_chars)
+        if not right:
+            break
+        pieces[target:target + 1] = [left, right] if left else [right]
+    return [p for p in pieces if p]
+
+
+def split_translated_text(
+    text: str,
+    total_duration: float,
+    start_time: float = 0.0,
+    max_duration: float = 6.0,
+    max_chars: int = 24,
+    min_duration: float = 0.6,
+) -> List[Tuple[str, float, float]]:
+    """把一段译文拆成若干字幕行，并按字符数比例分配时间
+
+    算法是「先切分、再打包」：
+      1. 按标点把译文切成小段；
+      2. 单个小段本身就超过 max_duration / max_chars 时继续硬拆（兜底）；
+      3. 再把相邻小段**累积打包**成一行，直到再接一段会超过 max_duration 或 max_chars
+         才换行 —— 所以短译文仍然是一行，不会被逐标点拆碎；
+      4. 按各行的字符数比例分配时间。
+
+    返回 `[(译文, 起始秒, 结束秒), ...]`，**各行时长之和恒等于 total_duration**。
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    total_duration = max(0.0, float(total_duration))
+    max_duration = max(0.5, float(max_duration))
+    max_chars = max(4, int(max_chars))
+    if total_duration <= 0.01:
+        # 原始行没有时间跨度（异常输入）时给一个按字数的估算，避免出现零长字幕
+        total_duration = max(min_duration, 0.2 * len(text))
+
+    pieces = [p.strip() for p in re.split(
+        rf"(?<=[{re.escape(_TRANS_BREAK_CHARS)}])", text
+    ) if p.strip()]
+    if not pieces:
+        pieces = [text]
+
+    # 单段就超限时先硬拆，保证后面打包一定能成功
+    pieces = _enforce_piece_limits(pieces, total_duration, max_duration, max_chars)
+    if not pieces:
+        pieces = [text]
+
+    total_chars = sum(len(p) for p in pieces) or 1
+
+    # 二次打包：短句合并成一行，长内容才拆行
+    rows: List[str] = []
+    cur = ""
+    cur_chars = 0
+    for piece in pieces:
+        if cur:
+            merged_chars = cur_chars + len(piece)
+            merged_dur = total_duration * merged_chars / total_chars
+            if merged_dur > max_duration + 1e-9 or merged_chars > max_chars:
+                rows.append(cur)
+                cur, cur_chars = piece, len(piece)
+                continue
+        cur = _smart_join(cur, piece)
+        cur_chars += len(piece)
+    if cur:
+        rows.append(cur)
+
+    # 按字符数比例分配时间，最后一行吸收浮点偏差，保证总时长精确
+    row_chars = [len(r) for r in rows]
+    sum_chars = sum(row_chars) or 1
+    out: List[Tuple[str, float, float]] = []
+    cursor = float(start_time)
+    for i, (row, rc) in enumerate(zip(rows, row_chars)):
+        if i == len(rows) - 1:
+            end = float(start_time) + total_duration
+        else:
+            end = cursor + total_duration * rc / sum_chars
+        if end - cursor < 0.05:
+            end = cursor + 0.05
+        out.append((row, cursor, end))
+        cursor = end
+
+    if out and out[-1][2] <= out[-1][1]:
+        out[-1] = (out[-1][0], out[-1][1], out[-1][1] + 0.05)
+    return out
+
+
+def build_translated_segments(
+    units: Sequence[TranslationUnit],
+    translations: Sequence[str],
+    with_speaker: bool = True,
+    max_duration: float = 6.0,
+    max_chars: int = 24,
+    min_duration: float = 0.6,
+    fallback_to_source: bool = True,
+) -> List[SubtitleSegment]:
+    """把译文回填成字幕片段列表（保留说话人标记与整体时间轴）
+
+    某一块译文为空（翻译失败 / 被中断）时，若 `fallback_to_source=True` 则**原样保留**
+    该块的原始字幕行，不做拆行，避免把源语言文本按译文规则切碎。
+    """
+    out: List[SubtitleSegment] = []
+    for idx, unit in enumerate(units):
+        translated = (translations[idx] if idx < len(translations) else "") or ""
+        translated = translated.strip()
+
+        if not translated:
+            if not fallback_to_source:
+                continue
+            for src in unit.segments:
+                _, body = split_speaker_prefix(src.text)
+                if not body:
+                    continue
+                out.append(
+                    SubtitleSegment(
+                        index=len(out) + 1,
+                        start_time=src.start_time,
+                        end_time=max(src.end_time, src.start_time + 0.05),
+                        text=body,
+                        speaker=unit.speaker if with_speaker else "",
+                    )
+                )
+            continue
+
+        rows = split_translated_text(
+            translated,
+            unit.duration,
+            unit.start,
+            max_duration=max_duration,
+            max_chars=max_chars,
+            min_duration=min_duration,
+        )
+        if not rows:
+            rows = [(translated, unit.start, unit.start + max(unit.duration, 0.6))]
+        for text, s, e in rows:
+            if not text:
+                continue
+            out.append(
+                SubtitleSegment(
+                    index=len(out) + 1,
+                    start_time=s,
+                    end_time=e,
+                    text=text,
+                    speaker=unit.speaker if with_speaker else "",
+                )
+            )
+    for i, seg in enumerate(out):
+        seg.index = i + 1
+    return out

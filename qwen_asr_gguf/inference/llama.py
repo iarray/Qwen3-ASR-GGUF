@@ -442,7 +442,11 @@ class LlamaModel:
     """模型的面向对象封装"""
     def __init__(self, path, n_gpu_layers=-1, use_gpu=1):
         self.ptr = self.load_model(path, n_gpu_layers=n_gpu_layers, use_gpu=use_gpu)
-            
+        if not self.ptr:
+            # 必须在这里抛错：后续 llama_model_get_vocab(None) 会直接段错误，
+            # 提前失败才能让上层降级（例如跳过翻译、仅输出原文）。
+            raise RuntimeError(f"GGUF 模型加载失败: {path}")
+
         self.vocab = llama_model_get_vocab(self.ptr)
         self.n_embd = llama_model_n_embd(self.ptr)
         self.eos_token = llama_vocab_eos(self.vocab)
@@ -553,8 +557,14 @@ class LlamaContext:
     def decode_token(self, token_id):
         """
         原子操作：设置单 Token Batch 并执行解码
+
+        注意：这里必须让 `token_arr` 活到 `llama_decode` 返回之后。
+        llama_batch_get_one 返回的结构体只持有裸指针，若数组提前被 GC 回收，
+        底层就会读到一段已经释放的内存（表现为偶发乱码 / 崩溃）。
         """
-        return self.decode(get_one_batch(token_id))
+        token_arr = (llama_token * 1)(int(token_id))
+        batch = llama_batch_get_one(token_arr, 1)
+        return llama_decode(self.ptr, batch)
 
     def get_logits(self):
         """获取 Batch 中最后一个启用 Logits 的 Token 的输出"""
@@ -599,6 +609,35 @@ class LlamaBatch:
     def seq_id(self): return self.struct.seq_id
     @property
     def logits(self): return self.struct.logits
+
+    def set_tokens(self, tokens, pos: int = 0, seq_id: int = 0, logits_last_only: bool = True):
+        """
+        纯文本 Batch：填入 Token ID（不填 Embedding）
+
+        与 set_embd 并列的另一种用法，用于普通 LLM 文本生成（例如翻译）。
+        注意：创建 Batch 时必须使用 embd_dim=0，否则底层会走 Embedding 模式。
+
+        Args:
+            tokens: Token ID 序列
+            pos: 起始位置，自动生成 [pos, pos+1, ...]
+            seq_id: 序列 ID
+            logits_last_only: 是否只在最后一个 Token 上计算 logits（生成任务用 True）
+        """
+        n_tokens = len(tokens)
+        if n_tokens > self.n_tokens_max:
+            raise ValueError(f"Batch 空间不足: {n_tokens} > {self.n_tokens_max}")
+
+        for i, t in enumerate(tokens):
+            self.token[i] = int(t)
+            self.pos[i] = pos + i
+
+        self.n_tokens = n_tokens
+        for i in range(n_tokens):
+            self.n_seq_id[i] = 1
+            self.seq_id[i][0] = seq_id
+            self.logits[i] = 1 if (logits_last_only is False or i == n_tokens - 1) else 0
+
+        return self
 
     def set_embd(self, data: np.ndarray, pos: Union[np.ndarray, int] = 0, seq_id: int = 0):
         """
