@@ -35,3 +35,23 @@ from .chinese_itn import chinese_to_num as itn
 from .audio import load_audio
 from . import exporters
 from . import subtitle
+from .subtitle import (
+    load_srt_segments,
+    parse_srt,
+    read_text_auto,
+    segments_to_srt,
+)
+from .translator import (
+    DEFAULT_TRANSLATION_PROMPT,
+    SubtitleTranslator,
+    TranslationConfig,
+    TranslationUnit,
+    available_gpu_backends,
+    build_translation_prompt,
+    build_translator,
+    describe_backends as describe_translation_backends,
+    missing_translation_models,
+    parse_numbered_translations,
+    resolve_translation_backend,
+    translation_model_available,
+)

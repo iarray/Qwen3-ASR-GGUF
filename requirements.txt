@@ -17,3 +17,12 @@ onnxruntime-directml
 pyannote.audio
 # 图形界面
 ttkbootstrap
+
+# 字幕翻译（基于 llama.cpp 直接推理 GGUF，不需要额外 Python 依赖）
+# - 把 Qwen3-8B-Q4_K_M.gguf 放进 model/ 目录即可
+# - GPU 加速取决于 qwen_asr_gguf/inference/bin/ 下的 llama.cpp 二进制：
+#     * 自带 ggml-vulkan.dll  → 支持 Vulkan（AMD / Intel / NVIDIA 均可）
+#     * 想用 CUDA 需自行替换为 llama.cpp 的 CUDA 版（含 ggml-cuda.dll）
+#   缺失时会自动回退 CPU，并在界面上给出提示
+# - 也支持直接把 .srt 字幕文件当输入「只翻译」（跳过解码 / 说话人识别 / 语音识别），
+#   仅依赖 srt 库（上方已列），不额外引入依赖

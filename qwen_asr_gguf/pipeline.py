@@ -1,15 +1,23 @@
 # coding=utf-8
 """
-pipeline.py - 语音识别 + 说话人识别 端到端流水线
+pipeline.py - 语音识别 + 说话人识别 + 字幕翻译 端到端流水线
 
 串联各模块，输出带说话人标记的 SRT 字幕：
 
     音频/视频文件
         ├─ ffmpeg / soundfile 解码为 16kHz 单声道
-        ├─ pyannote 说话人分离      → DiarizationResult (spk0 / spk1 ...)
+        ├─ 说话人分离（onnxruntime / pyannote）→ DiarizationResult (spk0 / spk1 ...)
         ├─ Qwen3-ASR GGUF 转录      → 文本 + ForceAligner 字级时间戳
         ├─ 标点语义断句 + 6 秒限长   → SubtitleSegment 列表
+        ├─ （可选）Qwen3-8B 翻译     → 保留说话人与时间轴，另存 <原名>.zh.srt
         └─ 落盘: <原名>.srt / .txt / .json
+
+也支持「只翻译已有字幕」：
+
+    xxx.srt  ──(parse_srt)──> SubtitleSegment
+             ──(Qwen3-8B 翻译)──> <原名>.zh.srt        （见 translate_subtitle_file）
+
+    该模式不加载 ASR / 说话人识别模型，适合字幕已经生成、只想补译文时省时间。
 
 通过 `on_event(kind, payload)` 向外持续汇报进度，供 CLI 与 GUI 复用。
 """
@@ -30,11 +38,14 @@ from .inference import (
     QwenASREngine,
     SpeakerDiarizer,
     SubtitleSegment,
+    SubtitleTranslator,
     TranscribeResult,
+    TranslationConfig,
     exporters,
     load_audio,
     subtitle as subtitle_mod,
 )
+from .inference.translator import DEFAULT_TRANSLATION_PROMPT
 
 # 各阶段在总进度中的权重
 _STAGE_WEIGHTS = {"load": 0.03, "diarize": 0.35, "asr": 0.55, "export": 0.07}
@@ -76,6 +87,20 @@ class PipelineConfig:
     export_txt: bool = True
     export_json: bool = True
 
+    # 翻译（可选，基于 llama.cpp + Qwen3-8B GGUF）
+    enable_translation: bool = False
+    translation_model: str = "Qwen3-8B-Q4_K_M.gguf"
+    translation_backend: str = "auto"          # auto / vulkan / cuda / cpu
+    translation_prompt: str = DEFAULT_TRANSLATION_PROMPT
+    translation_batch_size: int = 1            # 单次请求翻译几段；>1 更快但质量略降
+    translation_max_new_tokens: int = 512
+    translation_temperature: float = 0.3
+    translation_n_ctx: int = 4096
+    translation_n_gpu_layers: int = -1         # -1 = 全部层卸载到 GPU
+    translation_max_line_duration: float = 6.0
+    translation_max_line_chars: int = 24
+    translation_output_suffix: str = ".zh"     # 译文另存为 <原名>.zh.srt
+
     verbose: bool = False
 
 
@@ -86,13 +111,40 @@ class PipelineResult:
     srt_path: Optional[str] = None
     txt_path: Optional[str] = None
     json_path: Optional[str] = None
+    translated_srt_path: Optional[str] = None
     text: str = ""
     segments: List[SubtitleSegment] = field(default_factory=list)
+    translated_segments: List[SubtitleSegment] = field(default_factory=list)
     speakers: Optional[DiarizationResult] = None
     duration: float = 0.0
     elapsed: float = 0.0
     performance: Optional[dict] = None
     cancelled: bool = False
+    # "media" = 走了完整的解码 + 说话人 + 识别流程；
+    # "subtitle" = 输入本身就是 .srt，只做了翻译（srt_path 指向输入文件，未被改写）
+    source_kind: str = "media"
+
+    @property
+    def translation_only(self) -> bool:
+        return self.source_kind == "subtitle"
+
+
+# 可直接「只翻译」的输入扩展名（输入本身就是字幕，无需重跑识别）
+SUBTITLE_FILE_EXTS = (".srt",)
+
+
+def is_subtitle_file(path) -> bool:
+    """判断输入是否是字幕文件（.srt）——这类文件只会走翻译，不做识别"""
+    return Path(str(path)).suffix.lower() in SUBTITLE_FILE_EXTS
+
+
+def split_files_by_kind(paths) -> tuple:
+    """把输入路径分成 `(音视频列表, 字幕列表)`，保持原有顺序"""
+    media: List[str] = []
+    subs: List[str] = []
+    for p in paths:
+        (subs if is_subtitle_file(p) else media).append(str(p))
+    return media, subs
 
 
 def get_model_filenames(precision: str, is_aligner: bool = False) -> Dict[str, str]:
@@ -227,19 +279,52 @@ def build_diarizer(config: PipelineConfig) -> SpeakerDiarizer:
     )
 
 
+def find_missing_translation_model(config: PipelineConfig) -> List[str]:
+    """检查翻译模型是否存在（未开启翻译时返回空列表）"""
+    if not config.enable_translation:
+        return []
+    path = Path(config.model_dir) / config.translation_model
+    return [] if path.exists() else [str(path)]
+
+
+def build_translator(config: PipelineConfig) -> SubtitleTranslator:
+    """按配置构建字幕翻译器（模型此时不会加载，首次翻译时才载入）"""
+    return SubtitleTranslator(
+        TranslationConfig(
+            model_dir=config.model_dir,
+            model_fn=config.translation_model,
+            backend=config.translation_backend,
+            n_gpu_layers=config.translation_n_gpu_layers,
+            n_ctx=config.translation_n_ctx,
+            max_new_tokens=config.translation_max_new_tokens,
+            temperature=config.translation_temperature,
+            batch_size=config.translation_batch_size,
+            prompt_template=config.translation_prompt,
+            max_line_duration=config.translation_max_line_duration,
+            max_line_chars=config.translation_max_line_chars,
+            output_suffix=config.translation_output_suffix,
+            enabled=config.enable_translation,
+            verbose=config.verbose,
+        )
+    )
+
+
 class TranscriptionPipeline:
-    """语音识别 + 说话人识别 流水线"""
+    """语音识别 + 说话人识别（+ 可选字幕翻译）流水线"""
 
     def __init__(
         self,
         engine: QwenASREngine,
         diarizer: Optional[SpeakerDiarizer] = None,
         config: Optional[PipelineConfig] = None,
+        translator: Optional[SubtitleTranslator] = None,
     ):
         self.engine = engine
         self.diarizer = diarizer
+        self.translator = translator
         self.config = config or PipelineConfig()
         self._diarization_disabled = False
+        self._translation_disabled = False
 
     # ------------------------------------------------------------------ #
     def run(
@@ -254,6 +339,11 @@ class TranscriptionPipeline:
         duration: Optional[float] = None,
     ) -> PipelineResult:
         """处理单个音视频文件，产出 SRT 字幕"""
+        if self.engine is None:
+            raise RuntimeError(
+                "ASR 引擎未初始化，无法识别音视频文件；"
+                "若要处理 .srt 字幕文件请改用 translate_subtitle_file()。"
+            )
         cfg = self.config
         audio_path = str(audio_path)
         base = Path(audio_path)
@@ -419,6 +509,52 @@ class TranscriptionPipeline:
                 result.json_path = json_path
                 emit("file", kind="json", path=json_path)
 
+            # ---------------- 6. 字幕翻译（可选） ---------------- #
+            # 注意顺序：原字幕已经落盘，翻译只**新增**一个译文文件，绝不覆盖原文。
+            if (
+                cfg.enable_translation
+                and self.translator is not None
+                and not self._translation_disabled
+                and not result.cancelled
+                and segments
+            ):
+                emit("stage", stage="translate", message="正在翻译字幕 ...")
+                t_tr = time.time()
+                try:
+                    translated = self.translator.translate_segments(
+                        segments,
+                        with_speaker=with_speaker,
+                        on_progress=lambda cur, tot: emit(
+                            "stage",
+                            stage="translate",
+                            message=f"正在翻译字幕 {cur}/{tot} ...",
+                            progress=0.95 + 0.04 * (cur / max(1, tot)),
+                        ),
+                        on_stream=lambda piece: emit("translate_text", text=piece),
+                        cancel_event=cancel_event,
+                    )
+                    if translated:
+                        tsrt = f"{out_base}{cfg.translation_output_suffix}.srt"
+                        subtitle_mod.export_segments_to_srt(
+                            tsrt, translated, with_speaker=with_speaker
+                        )
+                        result.translated_segments = translated
+                        result.translated_srt_path = tsrt
+                        emit("file", kind="translated_srt", path=tsrt)
+                        emit(
+                            "stage",
+                            stage="translate",
+                            message=(
+                                f"翻译完成，共 {len(translated)} 条字幕，"
+                                f"耗时 {time.time() - t_tr:.1f} 秒"
+                            ),
+                            progress=0.99,
+                        )
+                except Exception as e:
+                    # 翻译失败只降级，不影响已经产出的原字幕
+                    self._translation_disabled = True
+                    emit("warning", message=f"字幕翻译失败，后续文件将跳过翻译：{e}")
+
             result.elapsed = time.time() - t0
             emit(
                 "stage",
@@ -431,6 +567,148 @@ class TranscriptionPipeline:
         finally:
             if self.engine is not None:
                 self.engine.set_callbacks(None, None, None, None)
+
+    # ------------------------------------------------------------------ #
+    def translate_subtitle_file(
+        self,
+        srt_path: str,
+        on_event: Optional[EVENT] = None,
+        cancel_event: Optional[threading.Event] = None,
+        with_speaker: Optional[bool] = None,
+        output_dir: Optional[str] = None,
+    ) -> PipelineResult:
+        """只翻译一个已有的 SRT 字幕文件（**不跑** ASR / 说话人识别）
+
+        用途：字幕已经生成好了（本工具上次跑过，或别的工具产出的），只想补一份译文时
+        直接把 `.srt` 喂进来即可 —— 省掉解码音频 + 说话人识别 + 语音识别的时间。
+
+        行为约定：
+        * 输入字幕**原样保留**，绝不覆盖；译文写到 `<原名><translate_suffix>.srt`；
+        * `with_speaker=None` 时按内容自动判断（只要有一行带 `[spkX]` 前缀就保留标记）；
+        * 需要 `config.enable_translation=True` 且 `translator` 已就绪，否则只读取不翻译。
+
+        Args:
+            with_speaker: None = 自动检测；True/False 强制保留或丢弃说话人标记
+            output_dir:   译文输出目录，默认与输入字幕同目录
+        """
+        cfg = self.config
+        src = Path(str(srt_path))
+        out_base = Path(output_dir) / src.stem if output_dir else src.with_suffix("")
+        result = PipelineResult(audio_path=str(srt_path), source_kind="subtitle")
+        t0 = time.time()
+
+        def emit(event: str, **payload):
+            if on_event is None:
+                return
+            try:
+                on_event(event, payload)
+            except Exception:
+                pass
+
+        def cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        def finish() -> PipelineResult:
+            result.elapsed = time.time() - t0
+            return result
+
+        # ---------------- 1. 读取并解析字幕 ---------------- #
+        emit("stage", stage="load", message=f"正在读取字幕: {src.name}")
+        try:
+            segments, has_speaker = subtitle_mod.load_srt_segments(src)
+        except Exception as e:
+            emit("warning", message=f"字幕解析失败：{e}")
+            return finish()
+
+        if not segments:
+            emit("warning", message=f"字幕文件里没有可用的字幕条目：{src}")
+            return finish()
+
+        if with_speaker is None:
+            with_speaker = has_speaker
+        # load_srt_segments 已经把 [spkX] 前缀拆进 speaker 字段；
+        # 若调用方明确要求不要说话人标记，就地把字段清空。
+        if not with_speaker:
+            for seg in segments:
+                seg.speaker = ""
+
+        result.segments = segments
+        result.srt_path = str(src)
+        result.duration = max(seg.end_time for seg in segments)
+        emit(
+            "stage",
+            stage="load",
+            message=(
+                f"已读取 {len(segments)} 条字幕"
+                + ("（含说话人标记）" if has_speaker else "（无说话人标记）")
+            ),
+            progress=0.05,
+        )
+
+        if cancelled():
+            result.cancelled = True
+            return finish()
+
+        # ---------------- 2. 翻译前置检查 ---------------- #
+        if not cfg.enable_translation or self.translator is None or self._translation_disabled:
+            emit("warning", message="未启用字幕翻译，仅读取了字幕文件，没有产生译文。")
+            return finish()
+
+        tsrt = f"{out_base}{cfg.translation_output_suffix}.srt"
+        try:
+            same_path = Path(tsrt).resolve() == src.resolve()
+        except Exception:
+            same_path = False
+        if same_path:
+            emit(
+                "warning",
+                message=(
+                    f"译文路径与输入字幕相同（{tsrt}），已放弃以免覆盖原文件；"
+                    "请修改「译文后缀」后再试。"
+                ),
+            )
+            return finish()
+
+        # ---------------- 3. 翻译 ---------------- #
+        emit("stage", stage="translate", message="正在翻译字幕 ...")
+        t_tr = time.time()
+        try:
+            translated = self.translator.translate_segments(
+                segments,
+                with_speaker=with_speaker,
+                on_progress=lambda cur, tot: emit(
+                    "stage",
+                    stage="translate",
+                    message=f"正在翻译字幕 {cur}/{tot} ...",
+                    progress=0.05 + 0.9 * (cur / max(1, tot)),
+                ),
+                on_stream=lambda piece: emit("translate_text", text=piece),
+                cancel_event=cancel_event,
+            )
+        except Exception as e:
+            self._translation_disabled = True
+            emit("warning", message=f"字幕翻译失败：{e}")
+            return finish()
+
+        if not translated:
+            emit("warning", message="没有产生任何译文，原字幕保持不变。")
+            return finish()
+
+        # ---------------- 4. 落盘译文（原字幕不动） ---------------- #
+        subtitle_mod.export_segments_to_srt(tsrt, translated, with_speaker=with_speaker)
+        result.translated_segments = translated
+        result.translated_srt_path = tsrt
+        emit("file", kind="translated_srt", path=tsrt)
+        emit(
+            "stage",
+            stage="done",
+            message=(
+                f"翻译完成，共 {len(translated)} 条字幕，"
+                f"耗时 {time.time() - t_tr:.1f} 秒"
+            ),
+            progress=1.0,
+        )
+        return finish()
 
     # ------------------------------------------------------------------ #
     def _asr_progress(self, idx: int, total: int) -> float:
@@ -453,6 +731,8 @@ class TranscriptionPipeline:
         return seen
 
     def release(self):
-        """释放说话人模型占用的资源"""
+        """释放说话人 / 翻译模型占用的资源"""
         if self.diarizer is not None:
             self.diarizer.release()
+        if self.translator is not None:
+            self.translator.release()

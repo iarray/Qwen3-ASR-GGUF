@@ -80,3 +80,6 @@ ui_settings.json
 model/
 logs/
 qwen_asr_gguf/inference/bin/
+.workbuddy/
+.workbuddy/memory/
+.workbuddy/memory/MEMORY.md

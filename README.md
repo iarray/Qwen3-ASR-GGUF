@@ -18,6 +18,9 @@ Qwen3-ASR 0.6B 与 Qwen3-ASR 1.7B 以及 Qwen3-ForceAligner 0.6B 均可用，
 - ✅ **说话人识别** - 分离说话人，字幕自动打上 `[spk0]` 标记
 - ✅ **说话人识别双后端** - ONNX Runtime（DirectML / CUDA / CPU，无需 HF Token）或 pyannote 原生 PyTorch
 - ✅ **智能断句** - 按标点做语义断句，每行字幕控制在 6 秒内
+- ✅ **字幕翻译** - Qwen3-8B GGUF 在识别结果上再译一份，保留说话人与时间轴，原字幕文件不动
+- ✅ **只翻译字幕** - 可直接把 `.srt` 丢进来，跳过解码 / 说话人识别 / 语音识别，省掉整条识别链路
+- ✅ **翻译加速** - Vulkan / CUDA / CPU 可选（复用 llama.cpp 二进制，无需额外 Python 依赖）
 - ✅ **图形界面** - ttkbootstrap 桌面端，批量处理 + 实时预览
 
 ## 性能表现
@@ -176,6 +179,31 @@ Aligner 模型是 0.6B 的。
 如果执意要用其它精度（fp32、fp16、int8）可以自行手动导出。
 
 
+#### 2.3 字幕翻译模型（可选）
+
+启用 `--translate` 时还需要一个翻译用的 LLM：
+
+| 文件 | 大小 | 说明 |
+|------|------|------|
+| `Qwen3-8B-Q4_K_M.gguf` | 约 4.7 GB | 通用多语翻译，Q4_K_M 量化 |
+
+直接放到 `model/` 目录即可，程序按文件名查找（可用 `--translate-model` 改成别的名字）：
+
+```bash
+# ModelScope
+modelscope download --model Qwen/Qwen3-8B-GGUF Qwen3-8B-Q4_K_M.gguf --local_dir ./model
+
+# HuggingFace
+huggingface-cli download Qwen/Qwen3-8B-GGUF Qwen3-8B-Q4_K_M.gguf --local-dir ./model
+```
+
+> 💡 其它 Qwen3 系列 GGUF（4B / 14B / 32B）也能直接用，只要满足：
+> ① 使用 ChatML 模板（词表里有 `<|im_start|>` / `<|im_end|>`）；
+> ② 文件名与 `--translate-model` 一致。
+>
+> ⚠️ 翻译模型体积较大，不会随 Release 的模型包一起分发，需要单独下载。
+
+
 #### 2.2 手动导出
 
 下载原始模型：
@@ -239,11 +267,6 @@ python transcribe.py test.mp3 --prec int4 --no-dml --no-vulkan --n-ctx 4096
 
 ```bash
 python 21-Run-ASR.py
-```
-
-### 运行翻译
-```bash
-uv run python .\transcribe.py ".\video.m4a"
 ```
 
 ### 4. 说话人识别 + 字幕
@@ -326,7 +349,112 @@ uv run python transcribe.py ".\video.m4a" --no-diarization
 [spk1] I didn't know you were there. Neither did I.
 ```
 
-### 5. 图形界面
+### 5. 字幕翻译（可选）
+
+在识别出的字幕基础上再翻译一份，**保留原字幕文件**，译文另存为 `<原名>.zh.srt`。
+
+```bash
+# 基础用法：英译中（使用默认提示词）
+uv run python transcribe.py ".\会议录音.m4a" --translate
+
+# Vulkan 加速（AMD / Intel / NVIDIA 通用）
+uv run python transcribe.py ".\video.m4a" --translate --translate-backend vulkan
+
+# CUDA 加速（需自行把 llama.cpp 二进制换成 CUDA 版）
+uv run python transcribe.py ".\video.m4a" --translate --translate-backend cuda
+
+# 自定义提示词
+uv run python transcribe.py ".\video.m4a" --translate --translate-prompt-file prompt.txt
+```
+
+翻译规则由程序侧保证，不依赖模型自由发挥：
+
+| 规则 | 实现 |
+|------|------|
+| 只翻完整语义 | 某行结尾没有句末标点（`.?!…`）时，与后续行**合并**后再送翻译，直到遇到句末标点 |
+| 时长守恒 | 合并块总时长 = 参与各行的**时长之和**；译文拆回多行后整体时长与合并块一致 |
+| 每行 ≤ 6 秒 | 译文优先按标点拆行，拆完仍超长的再按字符硬拆，保证每行 ≤ `--translate-max-line-duration` |
+| 保留说话人 | 每行译文仍以 `[spk0]` 开头；**说话人切换处不会合并**，避免标记错位 |
+| 原字幕保留 | 只新增 `<原名>.zh.srt`，原先的 `.srt` / `.txt` / `.json` 原封不动 |
+
+参数说明：
+
+| 参数 | 说明 |
+|------|------|
+| `--translate` | 开启字幕翻译（默认关闭） |
+| `--translate-model` | 翻译模型文件名，默认 `Qwen3-8B-Q4_K_M.gguf` |
+| `--translate-backend` | 加速后端：`auto` / `vulkan` / `cuda` / `cpu` |
+| `--translate-gpu-layers` | 卸载到 GPU 的层数，`-1` 表示全部 |
+| `--translate-batch` | 单次请求翻译几段，默认 `1`（逐段）。调大略快，但模型同时处理多段时容易丢语气词 |
+| `--translate-prompt` | 提示词字符串（必须含 `{text}`） |
+| `--translate-prompt-file` | 从文件读取提示词（优先于上一项） |
+| `--translate-max-line-duration` | 译文每行最长时长（秒），默认 `6.0` |
+| `--translate-max-line-chars` | 译文每行最长字数，默认 `24` |
+| `--translate-suffix` | 译文文件后缀，默认 `.zh` |
+
+默认提示词（可在界面「翻译设置」标签页里修改）：
+
+```text
+你是专业字幕翻译，只输出译文，不要额外解释。
+翻译规则：
+1. 英译中，符合中文口语习惯，不要直译英文句式，去掉欧化长句；
+2. 保留原句语气，自然流畅，像原生中文台词；
+3. 短句拆分，适合字幕阅读，不要堆砌长句；
+4. 专有名词保持统一。
+原文：
+{text}
+```
+
+> 💡 `{text}` 是原文占位符，它**之前**的内容会被当作系统提示。一次翻译多段时程序会自动
+> 追加「逐段编号输出」的格式要求；模型没按格式回答时会自动退化为逐段翻译，不会丢内容。
+
+#### 只翻译已有字幕文件（不重跑识别）
+
+字幕已经生成好了（本工具上次跑过，或别处拿到的），只想补一份译文时，
+**直接把 `.srt` 当输入**即可 —— 程序会跳过音频解码、说话人识别与语音识别，
+整条识别链路都不碰：
+
+```bash
+# 只翻译一个字幕文件
+uv run python transcribe.py ".\会议录音.srt" --translate
+
+# 一次翻译多个字幕（也支持与音视频混着传，程序会按类型分流）
+uv run python transcribe.py ".\a.srt" ".\b.srt" --translate --translate-suffix .zh
+
+# 字幕没有说话人标记也行（自动检测；有 [spkX] 前缀就自动保留）
+uv run python transcribe.py ".\no_speaker.srt" --translate
+```
+
+行为约定：
+
+| 项 | 说明 |
+|------|------|
+| 跳过识别 | 不加载 ASR 编码器 / 对齐器 / 说话人模型，只加载翻译模型 |
+| 原字幕保留 | 输入文件**原样不动**，译文写到 `<原名><后缀>.srt` |
+| 说话人标记 | 自动检测：字幕里带 `[spk0]` 这类前缀就保留，没有就不加 |
+| 合并与拆行 | 与「识别后翻译」完全一致（不完整句合并、时长守恒、每行 ≤ 6 秒） |
+| 编码兼容 | 自动识别 UTF-8 / UTF-8-BOM / GB18030 / BIG5；序号或时间轴不规范时走兜底解析 |
+| 后缀冲突保护 | 若译文路径与输入相同（例如后缀留空），会拒绝执行并提示换后缀 |
+
+实测（30 秒双人英文样本，12 条字幕）：**仅翻译耗时 8.6 秒**（含 2.5 秒模型加载），
+同样的文件走完整识别链路需要 50 秒以上。
+
+#### 加速后端
+
+翻译复用 `qwen_asr_gguf/inference/bin/` 下的 llama.cpp 二进制，无需额外 Python 依赖：
+
+| 后端 | 需要的动态库 | 说明 |
+|------|-------------|------|
+| `vulkan` | `ggml-vulkan.dll` | 项目自带，AMD / Intel / NVIDIA 通用 |
+| `cuda` | `ggml-cuda.dll` | 需自行替换成 llama.cpp 的 CUDA 版二进制 |
+| `cpu` | — | 始终可用 |
+
+选 `auto` 时按 CUDA → Vulkan → CPU 顺序探测；指定了但库不存在会自动回退 CPU，并在界面 / 日志里说明原因。
+
+> ⚠️ 翻译模型（约 4.7 GB）与 ASR 模型会同时驻留显存。显存紧张时可用 `--translate-gpu-layers`
+> 减少卸载层数，或在界面里把「GPU 层数」调小。
+
+### 6. 图形界面
 
 ```bash
 uv run python app.py
@@ -338,12 +466,23 @@ uv run python app.py
 - **识别后端**可选 `auto` / `onnx` / `pyannote`，**识别设备**可选 `auto` / `cpu` / `cuda` / `dml`；
   面板下方实时提示当前实际生效的后端与执行提供器（如「当前使用 ONNX Runtime（DirectML），无需 HuggingFace Token」）；
 - 支持**批量添加**音视频文件（mp4 / mkv / m4a / wav / mp3 …），按列表顺序**逐个**识别；
+- **「＋ 添加字幕」按钮可直接加 `.srt`**：这类文件只做翻译，自动跳过解码、说话人识别与
+  语音识别（连 ASR 模型都不加载），列表状态显示「完成 (仅翻译 12 条 → 译文 11 条)」。
+  音视频与字幕文件可以混在一个列表里，程序按扩展名自动分流；
 - 左侧列表实时显示每个文件的状态与检测到的说话人数；
-- **实时转录**标签页流式显示识别内容与当前说话人，**字幕预览**标签页展示最终 SRT；
+- **实时转录**标签页流式显示识别内容与当前说话人，**字幕预览**标签页展示最终 SRT，
+  **译文预览**标签页展示翻译结果；
+- **翻译设置**标签页：开关翻译、选翻译模型与加速后端（`auto` / `vulkan` / `cuda` / `cpu`）、
+  调整 GPU 层数与译文排版参数，并可直接编辑提示词（支持「恢复默认」「从文件导入」）；
+  页面顶部实时提示模型是否就绪、后端会落到哪；
 - 可配置模型目录、精度、ONNX 后端、Vulkan、上下文、分段时长、每行字幕时长/字数等；
 - 支持中途停止、浅色/深色主题切换，配置自动保存到 `ui_settings.json`。
 
-字幕输出在原音频文件所在目录，文件名与原文件一致（`xxx.mp4` → `xxx.srt`）。
+字幕输出在原音频文件所在目录，文件名与原文件一致（`xxx.mp4` → `xxx.srt`）；
+开启翻译后另生成 `xxx.zh.srt`，原字幕文件保持不变。
+
+> 💡 给列表里加 `.srt` 时，字幕文件**只会做翻译**。若「启用字幕翻译」是关闭的，
+> 点「开始识别」前会弹提示告诉你这些文件会被跳过；用「＋ 添加字幕」按钮则会主动问你要不要打开开关。
 
 
 部分代码解析：
@@ -418,17 +557,18 @@ graph TD
 ├── 18-Run-Aligner.py                        # Aligner 对齐 API 示例脚本
 ├── 21-Run-ASR.py                            # ASR 转录 API 示例脚本
 ├── 30-Export-Diarization-ONNX.py            # 导出说话人分离 ONNX 模型 (一次性，脱离 torch 推理)
-├── app.py                                   # 图形界面 (ttkbootstrap)：批量转录 + 说话人 + 字幕
+├── app.py                                   # 图形界面 (ttkbootstrap)：批量转录 + 说话人 + 字幕 + 翻译
 ├── transcribe.py                            # 命令行转录工具 (功能最全)
 └── qwen_asr_gguf/
-    ├── pipeline.py                          # 端到端流水线：解码 → 说话人 → 转录 → 断句 → 落盘
+    ├── pipeline.py                          # 端到端流水线：解码 → 说话人 → 转录 → 断句 → 落盘 → 翻译
     └── inference/
         ├── asr.py                  # ASR 核心引擎逻辑
         ├── aligner.py              # 强行对齐逻辑
         ├── encoder.py              # 音频特征提取逻辑 (ONNX 封装)
         ├── diarization.py          # 说话人识别门面 (ONNX / pyannote 双后端分派)
         ├── diarization_onnx.py     # 纯 onnxruntime 说话人分离实现 (DirectML / CUDA / CPU)
-        ├── subtitle.py             # 标点语义断句 + 6 秒限长 + 说话人合并
+        ├── subtitle.py             # 标点语义断句 + 6 秒限长 + 说话人合并 + 翻译的合并/拆行
+        ├── translator.py           # 字幕翻译 (Qwen3-8B GGUF，Vulkan / CUDA / CPU)
         ├── llama.py                # llama.cpp Python 绑定
         ├── exporters.py            # SRT/JSON/TXT 导出工具
         └── chinese_itn.py          # 中文数字规整 (ITN)
@@ -446,7 +586,19 @@ graph TD
     E --> F
     F --> G[按重叠投票绑定说话人]
     G --> H[xxx.srt / xxx.txt / xxx.json]
+    H -- 启用翻译时 --> I[合并不完整句子]
+    I --> J[Qwen3-8B 翻译<br/>Vulkan / CUDA / CPU]
+    J --> K[按标点拆行 + 时长按比例分配]
+    K --> L[xxx.zh.srt<br/>保留原字幕与说话人]
+
+    M[xxx.srt 字幕文件] --> N[解析 SRT<br/>剥离 spkX 前缀]
+    N --> I
+    style M fill:#ffe8cc,stroke:#e07b00
+    style N fill:#ffe8cc,stroke:#e07b00
 ```
+
+> 橙色部分是「只翻译字幕文件」的入口：`.srt` 直接送进第 2 步，
+> **不经过**解码、说话人分离与语音识别，因此不用加载 ASR 模型、耗时极短。
 
 ## 常见问题
 
@@ -489,12 +641,61 @@ uv run python 30-Export-Diarization-ONNX.py
 已修复：对齐器输出的纯空白项不再被丢弃，字幕拼接时会按 ASCII 词边界自动补空格
 （`Oh,hello.` → `Oh, hello.`）。
 
+**Q: 提示「未找到 ggml-cuda 动态库，已回退 CPU」怎么办？**
+
+项目自带的 llama.cpp 二进制只含 Vulkan 与 CPU 后端，没有 CUDA。要用 CUDA 请到
+[llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 下载 `cuda` 版压缩包，
+把其中的 `ggml-cuda.dll`（以及 `llama.dll` / `ggml*.dll`）覆盖到
+`qwen_asr_gguf/inference/bin/`。AMD / Intel 显卡直接用默认的 `vulkan` 即可。
+
+**Q: 翻译太慢 / 想更快怎么办？**
+
+按优先级排查：
+
+1. **字幕已经有了就直接喂字幕**：`uv run python transcribe.py a.srt --translate`（界面里用
+   「＋ 添加字幕」），跳过整条识别链路，实测能从 50 秒降到 8 秒左右；
+2. 确认后端不是 CPU —— 界面「翻译设置」里会显示实际生效的后端与原因；
+3. 让 `--translate-backend vulkan` 真正生效（AMD / Intel 也能用）；
+4. 显存够的话保持「GPU 层数」为 `-1`（全部卸载）。
+
+> `--translate-batch` 调大（如 4）只能快约 10%，但模型同时处理多段时容易丢语气词、
+> 专有名词也会译错，所以默认保持 1。
+
+**Q: 我字幕已经有了，只想补一份中文译文，还要重新跑识别吗？**
+
+不用。把 `.srt` 直接当输入即可，程序会跳过音频解码、说话人识别和语音识别：
+
+```bash
+uv run python transcribe.py ".\会议录音.srt" --translate
+```
+
+界面里点「＋ 添加字幕」选 `.srt` 也一样。输入字幕**原样保留**，译文另存为 `<原名>.zh.srt`；
+字幕里的 `[spk0]` 前缀会被自动识别并保留到译文里。支持 UTF-8 / GB18030 / BIG5 等编码。
+
+**Q: 为什么译文的行数比原文多？**
+
+译文按标点拆行、并按「每行不超过 `--translate-max-line-duration`（默认 6 秒）」重新排版，
+所以中文比英文紧凑时会拆得更细。拆出的所有行时长之和**等于**原来的合并块时长，时间轴不会漂移。
+如果觉得拆太碎，把 `--translate-max-line-duration` 调大，或把 `--translate-max-line-chars` 调大。
+
+**Q: 说话人标记会不会因为合并翻译而错位？**
+
+不会。合并只发生在**同一说话人**的连续行之间；一旦说话人切换就强制断开，
+因此每个翻译单元只对应一个 `[spk0]` 标记，译文不会串到别人头上。
+
+**Q: 翻译模型加载失败 / 显存不足怎么办？**
+
+翻译模型（约 4.7 GB）会与 ASR 模型同时占用显存。可以把「GPU 层数」从 `-1` 调小
+（例如 20），只把部分层放 GPU；或直接 `--translate-backend cpu`。
+翻译失败时程序只会跳过翻译，**不会影响已经生成的原字幕**。
+
 
 ---
 
 ## 致谢
 
 - [Qwen3-ASR](https://www.modelscope.cn/collections/Qwen/Qwen3-ASR) - 原始模型
+- [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B-GGUF) - 字幕翻译模型
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) - GGUF 推理引擎
 - [pyannote.audio](https://github.com/pyannote/pyannote-audio) - 说话人分离算法与预训练模型
 - [ONNX Runtime](https://onnxruntime.ai/) - 跨平台推理引擎（DirectML / CUDA / CPU）
