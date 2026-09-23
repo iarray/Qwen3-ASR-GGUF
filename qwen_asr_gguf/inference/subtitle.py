@@ -804,7 +804,6 @@ def _enforce_piece_limits(
         pieces[target:target + 1] = [left, right] if left else [right]
     return [p for p in pieces if p]
 
-
 def split_translated_text(
     text: str,
     total_duration: float,
@@ -814,58 +813,64 @@ def split_translated_text(
     min_duration: float = 0.6,
 ) -> List[Tuple[str, float, float]]:
     """把一段译文拆成若干字幕行，并按字符数比例分配时间
-
-    算法是「先切分、再打包」：
-      1. 按标点把译文切成小段；
-      2. 单个小段本身就超过 max_duration / max_chars 时继续硬拆（兜底）；
-      3. 再把相邻小段**累积打包**成一行，直到再接一段会超过 max_duration 或 max_chars
-         才换行 —— 所以短译文仍然是一行，不会被逐标点拆碎；
-      4. 按各行的字符数比例分配时间。
-
-    返回 `[(译文, 起始秒, 结束秒), ...]`，**各行时长之和恒等于 total_duration**。
+    切分规则：
+        1. 强制断点：。？，若句号/问号后面紧跟中文右双引号”，则在”之后强制切分
+        2. 逗号，：只要当前片段字符数 >=5，遇到逗号立刻切分
+        3. 禁止无标点中间硬截断，只允许在标点位置切分
+    返回 `[(译文, 起始秒, 结束秒), ...]`，各行时长之和恒等于 total_duration。
     """
     text = (text or "").strip()
     if not text:
         return []
-
     total_duration = max(0.0, float(total_duration))
     max_duration = max(0.5, float(max_duration))
-    max_chars = max(4, int(max_chars))
+    trigger_len = 5
+    min_duration = max(0.3, float(min_duration))
+
     if total_duration <= 0.01:
-        # 原始行没有时间跨度（异常输入）时给一个按字数的估算，避免出现零长字幕
         total_duration = max(min_duration, 0.2 * len(text))
 
-    pieces = [p.strip() for p in re.split(
-        rf"(?<=[{re.escape(_TRANS_BREAK_CHARS)}])", text
-    ) if p.strip()]
-    if not pieces:
-        pieces = [text]
+    force_char = {"。", "？"}
+    comma_char = {"，"}
+    right_quote = {"”"}
 
-    # 单段就超限时先硬拆，保证后面打包一定能成功
-    pieces = _enforce_piece_limits(pieces, total_duration, max_duration, max_chars)
-    if not pieces:
-        pieces = [text]
+    pieces: List[str] = []
+    pos = 0
+    n = len(text)
 
-    total_chars = sum(len(p) for p in pieces) or 1
+    while pos < n:
+        seg_start = pos
+        while pos < n:
+            ch = text[pos]
+            # -------- 强制断点：。？兼容后面 ” --------
+            if ch in force_char:
+                if pos + 1 < n and text[pos + 1] in right_quote:
+                    pos += 2
+                else:
+                    pos += 1
+                piece = text[seg_start:pos].strip()
+                if piece:
+                    pieces.append(piece)
+                break
+            # -------- 逗号：片段>=5字符立刻切 --------
+            if ch in comma_char:
+                buf = text[seg_start:pos+1].strip()
+                if len(buf) >= trigger_len:
+                    piece = buf
+                    if piece:
+                        pieces.append(piece)
+                    pos += 1
+                    break
+            pos +=1
+        else:
+            # 文本走到末尾，剩余部分
+            remain = text[seg_start:].strip()
+            if remain:
+                pieces.append(remain)
+            break
 
-    # 二次打包：短句合并成一行，长内容才拆行
-    rows: List[str] = []
-    cur = ""
-    cur_chars = 0
-    for piece in pieces:
-        if cur:
-            merged_chars = cur_chars + len(piece)
-            merged_dur = total_duration * merged_chars / total_chars
-            if merged_dur > max_duration + 1e-9 or merged_chars > max_chars:
-                rows.append(cur)
-                cur, cur_chars = piece, len(piece)
-                continue
-        cur = _smart_join(cur, piece)
-        cur_chars += len(piece)
-    if cur:
-        rows.append(cur)
+    rows = pieces
 
-    # 按字符数比例分配时间，最后一行吸收浮点偏差，保证总时长精确
     row_chars = [len(r) for r in rows]
     sum_chars = sum(row_chars) or 1
     out: List[Tuple[str, float, float]] = []
@@ -879,10 +884,11 @@ def split_translated_text(
             end = cursor + 0.05
         out.append((row, cursor, end))
         cursor = end
-
     if out and out[-1][2] <= out[-1][1]:
         out[-1] = (out[-1][0], out[-1][1], out[-1][1] + 0.05)
     return out
+
+
 
 
 def build_translated_segments(
@@ -922,9 +928,10 @@ def build_translated_segments(
                 )
             continue
 
+        real_window_duration = max(0.001, unit.end - unit.start)
         rows = split_translated_text(
             translated,
-            unit.duration,
+            real_window_duration, #unit.duration,
             unit.start,
             max_duration=max_duration,
             max_chars=max_chars,
