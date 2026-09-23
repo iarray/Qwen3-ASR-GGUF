@@ -1300,9 +1300,12 @@ class ASRApp(ttk.Window):
     def _drain_events(self):
         pending_text: list[str] = []
         pending_trans: list[str] = []
+        MAX_CONSUME_PER_CALL = 20   # 单次最多处理20条事件，防止吃光主线程时间片
+        consumed = 0
         try:
-            while True:
+            while consumed < MAX_CONSUME_PER_CALL:
                 kind, payload = self.events.get_nowait()
+                consumed +=1
                 if kind == "text":
                     pending_text.append(payload.get("text", ""))
                     continue
