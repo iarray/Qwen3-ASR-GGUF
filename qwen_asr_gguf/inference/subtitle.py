@@ -689,13 +689,13 @@ def split_speaker_prefix(text: str) -> Tuple[str, str]:
 def group_segments_for_translation(
     segments: Sequence[SubtitleSegment],
     max_group_duration: float = 30.0,
+    hard_max_group_duration: float = 45.0,
 ) -> List[TranslationUnit]:
-    """把字幕行按「完整句子」聚合为翻译单元
-
+    """把字幕行按「完整句子」聚合为翻译单元【修复版，增加类型防护】
     聚合规则：
-    1. 遇到句末标点（。！？!?…）就闭合一个单元；
-    2. 说话人切换时强制闭合 —— 否则合并后的译文无法再挂回唯一的说话人标记；
-    3. 单块时长超过 `max_group_duration` 时强制闭合，避免整段音频被并成一个超大请求。
+    1. 说话人切换 → 强制闭合单元
+    2. 当已累积时长 > max_group_duration：等待句末标点 / 说话人切换 / 文本结束再闭合；
+       到达 hard_max_group_duration，无论有无标点强制兜底截断。
     """
     units: List[TranslationUnit] = []
     cur: List[SubtitleSegment] = []
@@ -715,14 +715,18 @@ def group_segments_for_translation(
         merged = _join_pieces(texts).strip()
         if merged:
             speaker = cur[0].speaker or split_speaker_prefix(cur[0].text)[0]
+            # 强制转float，防御元组/非数值
+            start_val = float(cur[0].start_time)
+            end_val = float(max(float(s.end_time) for s in cur))
+            dur_sum = sum(max(0.0, float(s.end_time) - float(s.start_time)) for s in cur)
             units.append(
                 TranslationUnit(
                     texts=texts,
                     segments=list(cur),
                     text=merged,
-                    start=cur[0].start_time,
-                    end=max(s.end_time for s in cur),
-                    duration=sum(max(0.0, s.end_time - s.start_time) for s in cur),
+                    start=start_val,
+                    end=end_val,
+                    duration=dur_sum,
                     speaker=speaker,
                     complete=_ends_sentence(merged),
                 )
@@ -737,17 +741,28 @@ def group_segments_for_translation(
 
         if cur:
             prev_spk = cur[-1].speaker or split_speaker_prefix(cur[-1].text)[0]
+            # 说话人切换强制闭合
             if spk and prev_spk and spk != prev_spk:
                 flush()
-            elif (seg.end_time - cur[0].start_time) > max_group_duration:
-                flush()
-
         cur.append(seg)
-        if _ends_sentence(body):
-            flush()
 
+        # 全部强制float，防御tuple类型bug
+        cur_start = float(cur[0].start_time)
+        cur_end = float(max(float(s.end_time) for s in cur))
+        block_dur = cur_end - cur_start
+
+        should_flush = False
+        if _ends_sentence(body):
+            should_flush = True
+        elif block_dur >= hard_max_group_duration:
+            should_flush = True
+
+        if should_flush:
+            flush()
     flush()
     return units
+
+
 
 
 def _split_piece_once(text: str, max_chars: int) -> Tuple[str, str]:
